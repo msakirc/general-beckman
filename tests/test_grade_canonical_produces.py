@@ -1,0 +1,246 @@
+"""Grade chain validates the CANONICAL produces artifact, not ``tasks.result``.
+
+Root cause (task 567373, mission 90, [0.1] product_charter): schema'd
+``produces`` markdown steps auto-strip ``write_file`` — so the writer NARRATES
+("Wrote mission_90/.charter/product_charter.md containing all five sections…")
+instead of emitting the body. ``materialize_produces`` writes the correct
+artifact to disk (unconditionally), and ``verify_charter_shape`` + downstream
+consumers read THAT. But the grade chain read ``source.result`` (the narration,
+which has no ``##`` headers) → the schema gate reported "missing all 5 sections"
+→ a false-reject the writer cannot fix → byte-identical re-emit → degenerate DLQ.
+
+Uniform fix: for a single-``produces`` step the artifact is the materialized
+disk canonical. ``resolve_produces_artifact`` PULLS that, and the grade branch
+overrides the in-memory ``source['result']`` once so BOTH the deterministic
+schema gate AND the LLM grader (build_grading_spec reads source.result) judge
+the artifact, exactly as the rest of the engine already does.
+"""
+from __future__ import annotations
+
+import os
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+
+_CHARTER_SCHEMA = {
+    "product_charter": {
+        "type": "markdown",
+        "required_sections": [
+            "Product Positioning", "Brand Keywords", "Core Problem",
+            "Goals & Mission", "Solutions We Own",
+        ],
+        "_schema_version": "1",
+    }
+}
+
+# The agent's raw final_answer for a write-stripped step: a prose narration.
+# It NAMES the sections but carries no markdown headers — the exact 567373 shape.
+_NARRATION = (
+    "Wrote `mission_7/.charter/product_charter.md` (7.8KB) containing all five "
+    "required sections: Product Positioning, Brand Keywords (10 bullets), Core "
+    "Problem / JTBD, Goals & Mission with Desired Outcomes, and Solutions We "
+    "Own (5 solutions). The document is coherent and contains no placeholders."
+)
+
+# The canonical artifact materialize_produces wrote to disk — real headers.
+_CANONICAL = """## Product Positioning
+
+For busy professionals, HabitHub is the habit tracker that bets on streaks.
+
+## Brand Keywords
+
+- **Streak** — the core loop.
+- **Nudge** — gentle reminders.
+- **Insight** — weekly review.
+- **Calm** — no shame UX.
+- **Momentum** — compounding wins.
+
+## Core Problem / JTBD
+
+People start habits and quit by week two; the job is staying consistent.
+
+## Goals & Mission
+
+Mission: make consistency effortless.
+
+### Desired Outcomes
+- 80% week-4 retention.
+- Daily active streaks.
+- Positive affect.
+- Referral growth.
+
+## Solutions We Own
+
+### Streak Engine
+What it solves: drop-off. Typical path: log → streak → nudge. Outcome for the
+user: consistency. Boundaries: no social pressure. Guiding principles: calm.
+"""
+
+
+def _write_disk(ws_dir: str, rel_path: str, content: str) -> None:
+    abs_path = os.path.join(ws_dir, rel_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+# ── Unit: the resolver ───────────────────────────────────────────────────────
+
+def test_resolve_produces_artifact_reads_disk_over_narration(tmp_path, monkeypatch):
+    import src.tools.workspace as ws
+    from src.workflows.engine.hooks import resolve_produces_artifact
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    _write_disk(str(tmp_path), "mission_7/.charter/product_charter.md", _CANONICAL)
+
+    source = {"id": 1, "mission_id": 7, "result": _NARRATION}
+    source_ctx = {"produces": ["mission_7/.charter/product_charter.md"]}
+
+    out = resolve_produces_artifact(source, source_ctx)
+    assert isinstance(out, str) and "## Product Positioning" in out
+    assert out != _NARRATION
+
+
+_USER_FLOW = """---
+mission_id: 90
+surfaces: [web]
+---
+
+```mermaid
+graph TD
+    Landing["Landing Page"] --> Auth["Sign In"]
+    Auth --> Dashboard["Dashboard"]
+```
+"""
+
+
+def test_resolve_keeps_frontmatter_led_artifact_with_fenced_body(tmp_path, monkeypatch):
+    """A canonical .md whose BODY is a fenced block (user_flow ```mermaid) must
+    survive the resolver verbatim — its own fence is the artifact, not a
+    narration wrapper. Unwrapping it strips the frontmatter + fence and hands
+    the grader a bare ``graph TD`` fragment → WELL_FORMED:FAIL, even though
+    verify_user_flow_shape PASSED the same disk file (m90 567452)."""
+    import src.tools.workspace as ws
+    from src.workflows.engine.hooks import resolve_produces_artifact
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    _write_disk(str(tmp_path), "mission_90/.flow/user_flow.md", _USER_FLOW)
+
+    source = {"id": 567452, "mission_id": 90, "result": "Wrote the user flow."}
+    source_ctx = {"produces": ["mission_90/.flow/user_flow.md"]}
+
+    out = resolve_produces_artifact(source, source_ctx)
+    assert isinstance(out, str)
+    assert out.lstrip().startswith("---"), f"frontmatter stripped: {out[:60]!r}"
+    assert "surfaces: [web]" in out, "surfaces frontmatter lost"
+    assert "```mermaid" in out, "mermaid fence stripped → grader sees bare graph"
+
+
+def test_resolve_unwraps_narration_wrapped_disk_without_frontmatter(tmp_path, monkeypatch):
+    """Guard the ORIGINAL rescue: a disk file with NO leading frontmatter that
+    buries the real artifact inside a fence (write-stripped step narration
+    materialized to disk) is still unwrapped — the discriminator is 'leads with
+    frontmatter', so this narration-wrapped case keeps its behavior."""
+    import src.tools.workspace as ws
+    from src.workflows.engine.hooks import resolve_produces_artifact
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    wrapped = (
+        "## Analysis\n\nI wrote the config below.\n\n"
+        "```json\n{\"name\": \"widget\", \"version\": 3}\n```\n"
+    )
+    _write_disk(str(tmp_path), "mission_7/.build/config.json", wrapped)
+
+    source = {"id": 2, "mission_id": 7, "result": "narration"}
+    source_ctx = {"produces": ["mission_7/.build/config.json"]}
+
+    out = resolve_produces_artifact(source, source_ctx)
+    assert isinstance(out, str)
+    assert out.strip().startswith("{"), f"narration not unwrapped: {out[:60]!r}"
+    assert "## Analysis" not in out
+
+
+def test_resolve_concats_multi_produces_disk_over_narration(tmp_path, monkeypatch):
+    """A MULTI-produces step (e.g. 5.0d screen_inventory_and_shell → both
+    screen_inventory.md + shared_shell.md) is NOT single-produces, so the
+    canonical pull previously returned None → grade fell back to tasks.result =
+    the agent's narration ("## Analysis / ### Artifacts Produced") → the LLM
+    grader read a report instead of the deliverables and returned COMPLETE:NO
+    across every model (m90 567453). Resolve must concat the on-disk artifacts
+    so the grade judges the real files, not the narration."""
+    import src.tools.workspace as ws
+    from src.workflows.engine.hooks import resolve_produces_artifact
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    _write_disk(str(tmp_path), "mission_9/.flow/screen_inventory.md",
+                "---\ntotal_screens: 2\n---\n\n## Web\n- Home (`/`)\n- Settings (`/s`)\n")
+    _write_disk(str(tmp_path), "mission_9/.flow/shared_shell.md",
+                "---\napplicable_to_surfaces: [web]\n---\n\n## Header\nNav bar.\n")
+
+    source = {"id": 567453, "mission_id": 9, "result": _NARRATION}
+    source_ctx = {"produces": [
+        "mission_9/.flow/screen_inventory.md",
+        "mission_9/.flow/shared_shell.md",
+    ]}
+    out = resolve_produces_artifact(source, source_ctx)
+    assert isinstance(out, str)
+    assert out != _NARRATION
+    assert "Home (`/`)" in out           # screen_inventory body present
+    assert "Nav bar." in out             # shared_shell body present
+
+
+def test_resolve_returns_none_for_non_produces(tmp_path, monkeypatch):
+    import src.tools.workspace as ws
+    from src.workflows.engine.hooks import resolve_produces_artifact
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    source = {"id": 1, "mission_id": 7, "result": _NARRATION}
+    assert resolve_produces_artifact(source, {"produces": []}) is None
+    # Multi-produces whose disk files are all absent → keep tasks.result.
+    assert resolve_produces_artifact(
+        source, {"produces": ["a.md", "b.md"]}
+    ) is None
+
+
+def test_resolve_returns_none_when_disk_missing(tmp_path, monkeypatch):
+    import src.tools.workspace as ws
+    from src.workflows.engine.hooks import resolve_produces_artifact
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    source = {"id": 1, "mission_id": 7, "result": _NARRATION}
+    source_ctx = {"produces": ["mission_7/.charter/product_charter.md"]}
+    assert resolve_produces_artifact(source, source_ctx) is None
+
+
+# ── Behavioral: the grade gate judges canonical, not narration ───────────────
+
+@pytest.mark.asyncio
+async def test_grade_validates_canonical_disk_not_result_narration(tmp_path, monkeypatch):
+    import general_beckman.apply as apply_mod
+    import src.tools.workspace as ws
+
+    monkeypatch.setattr(ws, "WORKSPACE_DIR", str(tmp_path))
+    _write_disk(str(tmp_path), "mission_7/.charter/product_charter.md", _CANONICAL)
+
+    async def fake_apply(child_task, verdict):  # must NOT fire on a valid artifact
+        raise AssertionError(
+            f"valid on-disk charter must not short-circuit grade: {verdict.raw}"
+        )
+
+    monkeypatch.setattr(apply_mod, "_apply_posthook_verdict", fake_apply)
+
+    source = {
+        "id": 567373, "mission_id": 7, "result": _NARRATION,
+        "title": "product_charter", "description": "write the product charter",
+    }
+    source_ctx = {
+        "artifact_schema": _CHARTER_SCHEMA,
+        "produces": ["mission_7/.charter/product_charter.md"],
+    }
+
+    with patch.object(apply_mod, "enqueue", AsyncMock(return_value=901)) as enq:
+        await apply_mod._enqueue_posthook_llm_child("grade", source, source_ctx)
+
+    # Schema gate passed on the disk canonical → LLM grade child enqueued.
+    enq.assert_awaited_once()

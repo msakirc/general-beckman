@@ -1,0 +1,608 @@
+"""Queue hygiene sweep — port of watchdog.check_stuck_tasks.
+
+Renamed to sweep_queue(); telegram= parameter dropped.
+All Telegram notifications replaced with mechanical mr_roboto notify_user tasks.
+
+Preserves all 7 numbered sections from the original:
+  1. Tasks stuck in "processing" > 5 min
+  2. Ungraded tasks stuck > 30 min (safety net)
+  3. Tasks blocked by ALL failed deps → cascade failure
+  4. Parent tasks with all children done → rollup
+  5. Pending tasks with overdue next_retry_at → clear gate
+  6. waiting_human escalation tiers (4h nudge, 24h, 48h, 72h cancel)
+  7. Workflow-level timeout check
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+from yazbunu import get_logger
+from dabidabi.times import utc_now, db_now, to_db, from_db
+from general_beckman.task_context import parse_context
+
+logger = get_logger("beckman.sweep")
+
+
+async def _notify(message: str) -> None:
+    """Insert a mechanical notify_user task instead of sending Telegram inline."""
+    from dabidabi import add_task
+    from general_beckman.apply import _mechanical_context
+    await add_task(
+        title="Notify: stuck-task sweep",
+        description="",
+        agent_type="mechanical",
+        # Queue-hygiene status ping (stuck/cascade/escalation) — internal admin
+        # alert, not outward-facing comms. Bypass the SP6 critic gate so a
+        # stalled/vetoing critic can never silence sweep notifications.
+        context=_mechanical_context("notify_user", message=message, critic_gate=False),
+        depends_on=[],
+    )
+
+
+async def _resend_clarification(task_id: int) -> None:
+    """Re-send a waiting_human task's ORIGINAL interactive clarification.
+
+    A bare "Task #N needs your input" + title reminder is useless on its own:
+    to act, the founder had to scroll the whole chat history for the original
+    question and its options/buttons (e.g. 0.6a non_goals_confirm: the draft +
+    OK/Regenerate/Edit keyboard). Each escalation tier enqueues this so the
+    reminder is self-contained — the founder acts straight from it.
+
+    Goes through a mechanical ``resend_clarification`` task (same decoupling as
+    ``_notify``): mr_roboto loads the source task, reconstructs its clarify
+    payload, and re-runs the clarify executor — re-sending whatever interactive
+    message the gate first used. mr_roboto no-ops gracefully if the task has no
+    re-sendable clarification or the founder already answered.
+    """
+    from dabidabi import add_task
+    from general_beckman.apply import _mechanical_context
+    await add_task(
+        title=f"Re-send clarification: Task #{task_id}",
+        description="",
+        agent_type="mechanical",
+        context=_mechanical_context(
+            "resend_clarification", source_task_id=task_id,
+        ),
+        depends_on=[],
+    )
+
+
+def _producer_artifact_validity(ctx: dict, result, mission_id) -> tuple[bool, str]:
+    """Re-validate a stuck-ungraded PRODUCER's artifact against its own schema.
+
+    Returns ``(ok, error)``. ``ok=True`` when the task is NOT a schema-gated
+    producer (nothing to re-check — the safety net proceeds as before) OR its
+    stored artifact passes its ``artifact_schema``. ``ok=False`` with a reason
+    when a producer's artifact FAILS its own contract — the ungraded safety net
+    must then DLQ it (surface loudly), never silently promote it to
+    ``completed``.
+
+    Root: m90 4.4 (task 567430). A null ``database_schema`` stub
+    (``{tables: null, ...}``, a self-declared "Unable to produce JSON" failure)
+    was correctly rejected by every worker-path gate, got stranded in
+    ``ungraded`` with an empty ``_pending_posthooks``, and then rode the 30-min
+    safety net's raw ``UPDATE status='completed'`` — which never re-checked the
+    artifact — into ``completed``. That poisoned the whole phase-7 backend
+    build (7.4 db-setup can't build a DB with no tables). This re-asserts the
+    artifact contract at the exact seam (a non-worker completion) where it was
+    never enforced.
+
+    Mirrors the SYNC parts of the worker-path gate
+    (``hooks.py`` ``post_execute_workflow_step`` ~2006-2049): the
+    ``empty_ok_when_input_empty`` exemption is anchored to real upstream inputs
+    so a legitimately-empty scope is NOT false-DLQ'd; the async dynamic-
+    constraint resolution is skipped (its absence only RELAXES validation —
+    it can never turn a valid artifact into a false reject). Fails OPEN on a
+    tooling error (validator import/crash) — a bug in our re-check must not
+    wedge the queue — but fails CLOSED on an actual invalid artifact, which is
+    the hole being closed.
+    """
+    schema = ctx.get("artifact_schema")
+    if not isinstance(schema, dict) or not schema:
+        return True, ""
+    output_value = (
+        result if isinstance(result, str)
+        else (json.dumps(result, ensure_ascii=False) if result is not None else "")
+    )
+    if not output_value.strip():
+        return False, "empty artifact for a schema-gated producer step"
+    produces = ctx.get("produces") or []
+    produces_markdown = bool(produces) and all(
+        str(p).endswith(".md") for p in produces
+    )
+    try:
+        from src.workflows.engine.hooks import (
+            validate_artifact_schema, collect_empty_exemption_inputs,
+        )
+        gate_inputs = None
+        try:
+            gate_inputs = collect_empty_exemption_inputs(schema, mission_id)
+        except Exception:
+            gate_inputs = None
+        ok, err = validate_artifact_schema(
+            output_value, schema, inputs=gate_inputs,
+            produces_markdown=produces_markdown,
+        )
+        return bool(ok), ("" if ok else (err or "schema validation failed"))
+    except Exception as exc:
+        # Tooling failure (validator unavailable / raised) — do NOT block
+        # promotion on our own bug. Preserves the original safety-net behavior
+        # for the (rare) case the re-check itself can't run.
+        logger.debug(f"[Sweep] producer re-validation skipped (tooling): {exc}")
+        return True, ""
+
+
+async def sweep_queue() -> None:
+    """Task-level recovery: stuck, ungraded, dep cascade, subtasks,
+    overdue retry gates, waiting_human escalation, workflow timeouts."""
+    from dabidabi import get_db, update_task
+
+    db = await get_db()
+
+    # 1. Tasks stuck in "processing" for more than 5 minutes
+    #
+    # Gate against the dispatcher's in_flight registry: if the dispatcher
+    # still owns this task_id the row is NOT actually stuck — it's in a
+    # legitimate long iteration (planner with multi-tool_call, slow agent
+    # like architect/researcher, model swap mid-call). Flipping such a
+    # row to 'pending' corrupts /queue UI (live work disappears from "In
+    # Progress") AND burns a retry budget the dispatcher will redo. The
+    # 5-minute threshold predates the in_flight registry; it's a fallback
+    # for crashes / hung loops that bypass dispatcher cleanup, not a
+    # ceiling on legitimate long calls. (Handoff item N — observed
+    # mission 46 task 4040 got flipped mid-iteration 2026-04-26.)
+    cursor = await db.execute(
+        """SELECT id, title, worker_attempts, infra_resets, max_worker_attempts, context FROM tasks
+           WHERE status = 'processing'
+           AND started_at < datetime('now', '-5 minutes')"""
+    )
+    stuck_candidates = [dict(row) for row in await cursor.fetchall()]
+    try:
+        from src.core.in_flight import is_task_in_flight
+    except Exception:
+        is_task_in_flight = lambda _tid: False  # noqa: E731
+    stuck = []
+    for task in stuck_candidates:
+        if is_task_in_flight(task["id"]):
+            logger.debug(
+                f"[Sweep] Task #{task['id']} >5min processing but still "
+                f"in_flight — skipping flip"
+            )
+            continue
+        stuck.append(task)
+    from general_beckman.apply import _dlq_write
+    from src.core.retry import compute_retry_timing
+    for task in stuck:
+        # Infra-stuck and per-call availability are the same class of
+        # problem — "environment failed, wait and retry". Reuse the
+        # availability ladder (60 → 120 → ... 7200s cap, terminal at
+        # >=7200s) via compute_retry_timing. The doubling state lives in
+        # context['last_avail_delay'] (seconds of last delay), NOT in the
+        # infra_resets column: infra_resets stays a pure reset COUNT
+        # (startup recoveries + in-flight infra failures), and storing the
+        # ladder in context lets accelerate_retries — which zeroes
+        # last_avail_delay — actually reset the backoff for stuck rows.
+        ctx = parse_context(task)
+        last_delay = int(ctx.get("last_avail_delay") or 0)
+        decision = compute_retry_timing(
+            failure_type="availability",
+            last_avail_delay=last_delay,
+        )
+        if decision.action == "terminal":
+            logger.warning(
+                f"[Sweep] Task #{task['id']} stuck in processing; "
+                f"availability ladder exhausted ({last_delay}s), routing to DLQ"
+            )
+            fresh = dict(task)
+            fresh["failed_in_phase"] = "infrastructure"
+            await _dlq_write(
+                fresh,
+                error="Stuck in processing — availability backoff exhausted (sweep)",
+                category="availability",
+                attempts=int(task.get("worker_attempts") or 0),
+            )
+        else:
+            new_delay = decision.delay_seconds
+            ctx["last_avail_delay"] = new_delay
+            next_retry = to_db(utc_now() + timedelta(seconds=new_delay))
+            logger.warning(
+                f"[Sweep] Task #{task['id']} stuck in processing, "
+                f"backoff {new_delay}s (prev {last_delay}s)"
+            )
+            await db.execute(
+                "UPDATE tasks SET status = 'pending', "
+                "context = ?, retry_reason = 'availability', "
+                "next_retry_at = ? WHERE id = ?",
+                (json.dumps(ctx), next_retry, task["id"])
+            )
+    if stuck:
+        await db.commit()
+
+    # 2. Ungraded tasks stuck for > 30 min — safety net
+    #    Clock: prefer context.worker_completed_at, else started_at. NOTE:
+    #    worker_completed_at currently has NO production writer (only a test
+    #    sets it), so the clock effectively anchors to started_at today — the
+    #    net can fire 30 min after a task STARTED rather than 30 min after it
+    #    entered 'ungraded'. That premature firing used to be dangerous because
+    #    the promotion below never re-checked the artifact; the fail-closed
+    #    producer re-validation added below neutralizes it (invalid → DLQ,
+    #    valid → complete). Writing worker_completed_at on the ungraded
+    #    transition remains a tracked follow-up to make the clock honest.
+    cursor_ung = await db.execute(
+        "SELECT id, context, started_at, result, mission_id, agent_type, "
+        "worker_attempts, failed_in_phase FROM tasks WHERE status = 'ungraded'"
+    )
+    all_ungraded = [dict(row) for row in await cursor_ung.fetchall()]
+    stuck_ungraded = []
+    for task in all_ungraded:
+        ctx = parse_context(task)
+        ref_time_str = ctx.get("worker_completed_at") or task.get("started_at")
+        if not ref_time_str:
+            continue
+        try:
+            ref_dt = from_db(str(ref_time_str))
+            if (utc_now() - ref_dt).total_seconds() > 1800:
+                stuck_ungraded.append(task)
+        except (ValueError, TypeError):
+            continue
+
+    for task in stuck_ungraded:
+        # Post-hook regime: an 'ungraded' row with _pending_posthooks is
+        # legitimately awaiting a grader/summarizer verdict. Promoting it
+        # silently turns an uncertain verdict into a pass. Skip it —
+        # the post-hook DLQ cascade (apply._dlq_write) handles terminal
+        # failure when a post-hook task exhausts retries.
+        ctx = parse_context(task)
+        if ctx.get("_pending_posthooks"):
+            logger.debug(
+                f"[Sweep] Stuck ungraded #{task['id']} has pending posthooks "
+                f"{ctx['_pending_posthooks']}; leaving for verdict path"
+            )
+            continue
+        # Fail-closed producer gate: NEVER let a producer whose stored artifact
+        # fails its own artifact_schema ride the safety net into 'completed'
+        # (m90 4.4 — a null database_schema stub did exactly that and poisoned
+        # phase 7). Re-assert the contract here, the one seam a non-worker
+        # completion currently skips. Invalid → DLQ (loud), not silent pass.
+        _ok, _verr = _producer_artifact_validity(
+            ctx, task.get("result"), task.get("mission_id")
+        )
+        if not _ok:
+            await _dlq_write(
+                task,
+                error=f"ungraded safety-net: producer artifact invalid — {_verr}",
+                category="quality",
+                attempts=int(task.get("worker_attempts") or 0),
+            )
+            logger.warning(
+                f"[Sweep] Stuck ungraded producer #{task['id']} FAILED "
+                f"re-validation → DLQ (not completed): {_verr}"
+            )
+            continue
+        await db.execute(
+            "UPDATE tasks SET status = 'completed', "
+            "completed_at = ? WHERE id = ?",
+            (db_now(), task["id"]),
+        )
+        logger.warning(f"[Sweep] Stuck ungraded #{task['id']} promoted to completed (safety net)")
+    if stuck_ungraded:
+        await db.commit()
+
+    # 2b. Auto-rescue failed workflow-step tasks whose skip_when expression
+    # now matches (e.g. after a later code fix made the expression evaluable,
+    # or an upstream artifact flipped to a state that shouldn't have run
+    # the step). Mark them skipped + resolve their DLQ entry so downstream
+    # deps stop cascading as failures. Without this, any pre-fix DLQ on a
+    # skip-eligible step permanently blocks its dependents until a human
+    # retries or the mission is cancelled (2026-04-24: task 3122 synth_one
+    # stuck on a clarify gate it should have skipped, cascade-failed 3126).
+    try:
+        from src.workflows.engine.hooks import should_skip_workflow_step
+        import json as _json
+        resc_cursor = await db.execute(
+            """SELECT id, context, mission_id FROM tasks
+               WHERE status = 'failed'
+               AND context LIKE '%"is_workflow_step": true%'
+               LIMIT 50"""
+        )
+        for row in await resc_cursor.fetchall():
+            tid, ctx_raw, mid = row["id"], row["context"], row["mission_id"]
+            try:
+                should_skip, reason = await should_skip_workflow_step(
+                    {"id": tid, "mission_id": mid, "context": ctx_raw}
+                )
+            except Exception:
+                continue
+            if not should_skip:
+                continue
+            logger.info(
+                f"[Sweep] Auto-rescue: failed task #{tid} now matches "
+                f"skip_when ({reason}) — marking skipped"
+            )
+            try:
+                ctx = _json.loads(ctx_raw or "{}")
+                if isinstance(ctx, str):
+                    ctx = _json.loads(ctx)
+                if not isinstance(ctx, dict):
+                    ctx = {}
+                ctx["requires_grading"] = False
+                await db.execute(
+                    "UPDATE tasks SET status='skipped', error=? , context=? WHERE id=?",
+                    (f"retro-skipped: {reason}", _json.dumps(ctx), tid),
+                )
+                await db.execute(
+                    """UPDATE dead_letter_tasks
+                       SET resolved_at=CURRENT_TIMESTAMP,
+                           resolution='retro-skipped'
+                       WHERE task_id=? AND resolved_at IS NULL""",
+                    (tid,),
+                )
+            except Exception as _e:
+                logger.debug(f"auto-rescue db update failed for #{tid}: {_e}")
+                continue
+        await db.commit()
+    except Exception as exc:
+        logger.debug(f"auto-rescue sweep skipped: {exc}")
+
+    # 3. Dep-cascade removed by design: failed deps do NOT cascade to
+    #    dependents. A task that truly can't proceed ends up in DLQ;
+    #    its dependents simply wait until the human resolves the DLQ
+    #    (via /retry → the dep re-runs, possibly skipping via
+    #    skip_when or completing after a code fix; or cancel → the
+    #    mission itself is cancelled). Auto-cascading would take
+    #    decisions that belong to the human operator. Prevention is
+    #    handled upstream by skip_when + grader feedback + auto-rescue
+    #    of skip-eligible failures (see 2b).
+    #
+    # The earlier ``if blocked: await db.commit()`` here referenced a
+    # variable that section 3 used to populate; the section was deleted
+    # by design but the orphan commit remained. Removed to stop the
+    # ``name 'blocked' is not defined`` cron-fire-failed warning from
+    # firing on every sweep tick (handoff item R).
+
+    # 4. Parent tasks with all children done
+    cursor3 = await db.execute(
+        "SELECT id, title FROM tasks WHERE status = 'waiting_subtasks'"
+    )
+    waiting = [dict(row) for row in await cursor3.fetchall()]
+    for task in waiting:
+        child_cursor = await db.execute(
+            """SELECT COUNT(*) as total,
+               SUM(CASE WHEN status IN (
+                   'completed','failed','cancelled','skipped'
+               ) THEN 1 ELSE 0 END) as done,
+               SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count
+               FROM tasks WHERE parent_task_id = ?""",
+            (task["id"],),
+        )
+        row = await child_cursor.fetchone()
+        if row and row["total"] > 0 and row["total"] == row["done"]:
+            if row["completed_count"] > 0:
+                logger.info(f"[Sweep] Task #{task['id']} all subtasks done, marking complete")
+                await db.execute(
+                    "UPDATE tasks SET status = 'completed', "
+                    "completed_at = ? WHERE id = ?",
+                    (db_now(), task["id"]),
+                )
+            else:
+                logger.warning(f"[Sweep] Task #{task['id']} all subtasks failed, routing to DLQ")
+                task_for_dlq = dict(task)
+                task_for_dlq["failed_in_phase"] = "worker"
+                await _dlq_write(
+                    task_for_dlq,
+                    error="All subtasks failed",
+                    category="subtasks",
+                    attempts=int(task.get("worker_attempts") or 0),
+                )
+    if waiting:
+        await db.commit()
+
+    # 5. Pending tasks with next_retry_at far in the past
+    cursor_overdue = await db.execute(
+        """SELECT id FROM tasks
+           WHERE status = 'pending'
+           AND next_retry_at < datetime('now', '-1 hour')"""
+    )
+    overdue = [dict(row) for row in await cursor_overdue.fetchall()]
+    for task in overdue:
+        await db.execute(
+            "UPDATE tasks SET next_retry_at = NULL WHERE id = ?",
+            (task["id"],),
+        )
+    if overdue:
+        await db.commit()
+        logger.info(f"[Sweep] Cleared overdue next_retry_at for {len(overdue)} task(s)")
+
+    # 6. Escalation tiers for tasks stuck in waiting_human
+    #    Uses started_at as the baseline timestamp (set when task
+    #    began processing, before entering waiting_human).
+    #    We compute the threshold in Python with isoformat() so the
+    #    string comparison matches the format used when storing
+    #    started_at (which also uses db_now() format).
+    threshold_24h = to_db(
+        utc_now() - timedelta(hours=24)
+    )
+
+    # Tier 0: 4-hour gentle nudge (no escalation count increment)
+    threshold_4h = to_db(
+        utc_now() - timedelta(hours=4)
+    )
+    cursor_nudge = await db.execute(
+        """SELECT id, title, context FROM tasks
+           WHERE status = 'waiting_human'
+           AND started_at < ?
+           AND started_at >= ?""",
+        (threshold_4h, threshold_24h),
+    )
+    nudge_tasks = [dict(row) for row in await cursor_nudge.fetchall()]
+    for task in nudge_tasks:
+        task_ctx = parse_context(task)
+        if not task_ctx.get("nudge_sent"):
+            task_ctx["nudge_sent"] = True
+            await update_task(task["id"], context=json.dumps(task_ctx))
+            await _notify(
+                f"\U0001f4ac Gentle reminder: Task #{task['id']} needs your input.\n"
+                f"*{task['title']}*"
+            )
+            # Re-send the original question + options/buttons so the founder
+            # acts from the reminder, not from scrolling history.
+            await _resend_clarification(task["id"])
+
+    cursor_clar = await db.execute(
+        """SELECT id, title, context, started_at FROM tasks
+           WHERE status = 'waiting_human'
+           AND started_at < ?""",
+        (threshold_24h,),
+    )
+    stale = [dict(row) for row in await cursor_clar.fetchall()]
+    for task in stale:
+        # Parse escalation_count from task context
+        task_ctx = parse_context(task)
+        escalation_count = task_ctx.get("escalation_count", 0)
+        tid = task["id"]
+        ttitle = task["title"]
+
+        # Calculate hours since started_at
+        try:
+            started = from_db(task["started_at"])
+        except (ValueError, TypeError):
+            started = datetime.min.replace(tzinfo=timezone.utc)
+        hours_waiting = (
+            utc_now() - started
+        ).total_seconds() / 3600
+
+        if escalation_count == 0 and hours_waiting >= 24:
+            # Tier 1: 24h reminder
+            task_ctx["escalation_count"] = 1
+            await update_task(
+                tid, context=json.dumps(task_ctx),
+            )
+            logger.info(
+                f"[Sweep] Task #{tid} escalation tier 1 (24h)"
+            )
+            await _notify(
+                f"\u23f0 Task #{tid} has been waiting for "
+                f"clarification for 24h.\n*{ttitle}*"
+            )
+            await _resend_clarification(tid)
+        elif escalation_count == 1 and hours_waiting >= 48:
+            # Tier 2: 48h urgent
+            task_ctx["escalation_count"] = 2
+            await update_task(
+                tid, context=json.dumps(task_ctx),
+            )
+            logger.info(
+                f"[Sweep] Task #{tid} escalation tier 2 (48h)"
+            )
+            await _notify(
+                f"\U0001f6a8 *URGENT:* Task #{tid} needs your input!\n"
+                f"*{ttitle}*\n\n"
+                f"_This task will be cancelled in 24h if no "
+                f"response is received._"
+            )
+            await _resend_clarification(tid)
+        elif escalation_count >= 2 and hours_waiting >= 72:
+            # Tier 3: 72h cancel
+            task_ctx["escalation_count"] = 3
+            logger.warning(
+                f"[Sweep] Task #{tid} escalation tier 3 "
+                f"(72h), cancelling"
+            )
+            await update_task(
+                tid, status="cancelled",
+                error="No clarification received within 72h",
+                context=json.dumps(task_ctx),
+            )
+            await _notify(
+                f"\u274c Task #{tid} cancelled — no clarification "
+                f"received after 72h.\n*{ttitle}*"
+            )
+
+    # 8. Pending tasks past their max_worker_attempts ceiling.
+    #
+    # Mission 46 had two rows (2939, 2942) sit pending for hours with
+    # ``worker_attempts > max_worker_attempts``. Root cause was the
+    # cold-start admission deadlock (now fixed in _local_pressure) but
+    # without a defensive guard such rows can still appear from any
+    # future bug that updates worker_attempts without flipping status
+    # to failed. Force them to DLQ so the human sees the failure and
+    # can /retry — silent stuck-pending corrupts queue accounting.
+    # (Handoff item A.)
+    cursor_overcap = await db.execute(
+        """SELECT id, title, worker_attempts, max_worker_attempts,
+                  error_category, mission_id
+           FROM tasks
+           WHERE status = 'pending'
+             AND worker_attempts >= COALESCE(max_worker_attempts, 15)"""
+    )
+    overcap = [dict(row) for row in await cursor_overcap.fetchall()]
+    for task in overcap:
+        attempts = int(task.get("worker_attempts") or 0)
+        max_att = int(task.get("max_worker_attempts") or 15)
+        category = task.get("error_category") or "worker"
+        # Transient/availability failures ride the full backoff ladder — apply
+        # the SAME effective cap decide_retry and the admission cap-guard use, or
+        # this sweep force-DLQs an availability task at the raw quality cap (6)
+        # while it is correctly waiting out a daily-quota reset. The SQL above
+        # pre-selects on the RAW column (a function can't run in SQLite); the
+        # effective check has to happen here (mission_79 #225600: cat=availability
+        # sat pending 6/6 and the sweep killed it "Worker attempts exceeded: 6/6"
+        # — the "3-site unification" wired decide_retry + admission but missed
+        # this SQL). See general_beckman/retry.py::effective_max_attempts.
+        from general_beckman.retry import effective_max_attempts
+        eff_max = effective_max_attempts(category, max_att)
+        if eff_max > 0 and attempts < eff_max:
+            continue
+        logger.warning(
+            f"[Sweep] Task #{task['id']} pending past cap "
+            f"({attempts}/{eff_max}) — forcing DLQ (category={category})"
+        )
+        fresh = dict(task)
+        fresh["failed_in_phase"] = "worker"
+        await _dlq_write(
+            fresh,
+            error=f"Worker attempts exceeded: {attempts}/{eff_max}",
+            category=category,
+            attempts=attempts,
+        )
+    if overcap:
+        await db.commit()
+
+    # 9. Auto-resolve DLQ rows whose mechanical action is known-decommissioned.
+    #
+    # Pre-Phase-2b cron seeds and old workflow shapes left DLQ entries
+    # like ``unknown mechanical action: 'api_discovery'`` and
+    # ``unknown mechanical action: 'daily_digest'``. Both cron rows are
+    # already excluded from the seed (general_beckman/cron_seed.py
+    # comment "daily_digest + api_discovery cadences intentionally
+    # omitted") and ``unknown mechanical action: None`` rows come from
+    # legacy clarify_variant shapes the expander now translates. The
+    # surviving DLQ rows are inert clutter — resolve them so /dlq
+    # accounting reflects reality. Idempotent: WHERE resolved_at IS NULL
+    # makes re-runs no-ops. (Handoff item M.)
+    try:
+        await db.execute(
+            """UPDATE dead_letter_tasks
+                  SET resolved_at = CURRENT_TIMESTAMP,
+                      resolution = 'decommissioned-mechanical-action'
+                WHERE resolved_at IS NULL
+                  AND original_agent = 'mechanical'
+                  AND (error LIKE 'unknown mechanical action: ''api_discovery''%'
+                    OR error LIKE 'unknown mechanical action: ''daily_digest''%'
+                    OR error LIKE 'unknown mechanical action: None%')"""
+        )
+        await db.commit()
+    except Exception as exc:
+        logger.debug(f"[Sweep] decommissioned-action DLQ cleanup skipped: {exc}")
+
+    # Workflow-level wall-clock timeout killed 2026-04-22 (queue-gated
+    # missions could be paused while simply waiting on admission).
+
+    await db.commit()
+
+    try:
+        from general_beckman.queue_profile_push import build_and_push
+        await build_and_push()
+    except Exception as e:
+        logger.debug(f"[Sweep] queue_profile push failed: {e}")

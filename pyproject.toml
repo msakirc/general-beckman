@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "general_beckman"
+version = "0.1.0"
+description = "Task master for KutAI: SQLite task queue, admission against model and quota pressure, retries and dead-letter queue."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Sakir Cimen" }]
+keywords = ["task-queue", "orchestration", "scheduler", "ai-agents", "sqlite", "kutai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Framework :: AsyncIO",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "clair_obscur @ git+https://github.com/msakirc/clair-obscur.git",
+    "coulson @ git+https://github.com/msakirc/coulson.git",
+    "dabidabi @ git+https://github.com/msakirc/dabidabi.git",
+    "dogru_mu_samet @ git+https://github.com/msakirc/dogru-mu-samet.git",
+    "fatih_hoca @ git+https://github.com/msakirc/fatih-hoca.git",
+    "finch @ git+https://github.com/msakirc/finch.git",
+    "husam @ git+https://github.com/msakirc/husam.git",
+    "kara_kutu @ git+https://github.com/msakirc/kara-kutu.git",
+    "kuleden_donen_var @ git+https://github.com/msakirc/kuleden-donen-var.git",
+    "mr_roboto @ git+https://github.com/msakirc/mr-roboto.git",
+    "nerd_herd @ git+https://github.com/msakirc/nerd-herd.git",
+    "yalayut @ git+https://github.com/msakirc/yalayut.git",
+    "aiosqlite>=0.19.0",
+    "croniter>=6.2",
+    "yazbunu @ git+https://github.com/msakirc/yazbunu.git",
+]
+
+[project.urls]
+Homepage = "https://github.com/msakirc/general-beckman"
+Repository = "https://github.com/msakirc/general-beckman"
+Monorepo = "https://github.com/msakirc/kutai/tree/main/packages/general_beckman"
+
+[tool.setuptools.packages.find]
+where = ["src"]
